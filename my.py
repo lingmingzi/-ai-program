@@ -53,6 +53,21 @@ def load_cifar10():
     X_test, y_test = load_batch(os.path.join(CIFAR_DIR, "test_batch"))
     return X_train, y_train, X_test, y_test
 
+def data_augmentation(X):
+    """简单的数据增广：随机翻转、随机亮度调整"""
+    X_aug = X.copy()
+    N, C, H, W = X_aug.shape
+    for i in range(N):
+        img = X_aug[i]
+        if np.random.rand() < 0.5:
+            img = img[:, :, ::-1]
+        if np.random.rand() < 0.2:
+            img = img[:, ::-1, :]
+        brightness = np.random.uniform(0.8, 1.2)
+        img = np.clip(img * brightness, 0, 1)
+        X_aug[i] = img
+    return X_aug
+
 # --------------------------
 # 2. Optimizers
 # --------------------------
@@ -197,14 +212,15 @@ class MaxPool2x2:
         # x: (N,C,H,W)
         self.x = x
         N,C,H,W = x.shape
-        out = np.zeros((N,C,H//2,W//2), dtype=x.dtype)
+        out_h, out_w = H // 2, W // 2
+        out = np.zeros((N,C,out_h,out_w), dtype=x.dtype)
         self.mask = np.zeros_like(x, dtype=bool)
-        for i in range(0,H,2):
-            for j in range(0,W,2):
-                block = x[:,:,i:i+2,j:j+2]
+        for i in range(out_h):
+            for j in range(out_w):
+                block = x[:,:,2*i:2*i+2,2*j:2*j+2]
                 maxv = np.max(block, axis=(2,3), keepdims=True)
-                out[:,:,i//2,j//2] = maxv.squeeze()
-                self.mask[:,:,i:i+2,j:j+2] = (block == maxv)
+                out[:,:,i,j] = maxv.squeeze()
+                self.mask[:,:,2*i:2*i+2,2*j:2*j+2] = (block == maxv)
         return out
     def backward(self, grad):
         N,C,H,W = self.x.shape
@@ -270,21 +286,24 @@ class BatchNorm:
     def forward(self, x, training=True):
         # x shape: conv -> (N,C,H,W), fc -> (N,D)
         self.x_shape = x.shape
+        self.x = x
+        self.training = training
+        
         if self.for_conv:
-            # compute mean/var per channel over N,H,W
             mean = np.mean(x, axis=(0,2,3), keepdims=True)
             var = np.var(x, axis=(0,2,3), keepdims=True)
             if training:
                 self.mean = mean; self.var = var
                 self.x_hat = (x - mean) / np.sqrt(var + self.eps)
                 out = self.gamma * self.x_hat + self.beta
-                # update running stats
                 self.running_mean = self.momentum * self.running_mean + (1-self.momentum) * mean
                 self.running_var = self.momentum * self.running_var + (1-self.momentum) * var
                 return out
             else:
-                x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
-                return self.gamma * x_hat + self.beta
+                self.mean = self.running_mean
+                self.var = self.running_var
+                self.x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
+                return self.gamma * self.x_hat + self.beta
         else:
             mean = np.mean(x, axis=0, keepdims=True)
             var = np.var(x, axis=0, keepdims=True)
@@ -296,8 +315,10 @@ class BatchNorm:
                 self.running_var = self.momentum * self.running_var + (1-self.momentum) * var
                 return out
             else:
-                x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
-                return self.gamma * x_hat + self.beta
+                self.mean = self.running_mean
+                self.var = self.running_var
+                self.x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
+                return self.gamma * self.x_hat + self.beta
 
     def backward(self, grad_out):
         # grad_out shape matches x
@@ -436,39 +457,63 @@ class SimpleCNN:
 # --------------------------
 # 8. Training Loop
 # --------------------------
+import sys
+
 def accuracy(pred, y):
     return np.mean(pred == y)
 
 def train(model, X_train, y_train, X_test, y_test,
-          epochs=5, batch_size=128, verbose=True):
+          epochs=50, batch_size=128, verbose=True, use_augmentation=True):
     n_train = X_train.shape[0]
     steps_per_epoch = (n_train + batch_size - 1) // batch_size
     history = {"loss": [], "val_acc": []}
     for ep in range(epochs):
         t0 = time.time()
-        # shuffle
         idx = np.random.permutation(n_train)
-        X_train = X_train[idx]; y_train = y_train[idx]
+        X_train_sh = X_train[idx]
+        y_train_sh = y_train[idx]
+        
+        # 应用数据增广
+        if use_augmentation:
+            X_train_sh = data_augmentation(X_train_sh)
+        
         losses = []
+        accs = []
+        num_batches = 0
+        print(f"\nEpoch {ep+1}/{epochs}", flush=True)
+        sys.stdout.flush()
         for i in range(0, n_train, batch_size):
-            xb = X_train[i:i+batch_size]
+            xb = X_train_sh[i:i+batch_size]
             yb = y_train[i:i+batch_size]
             logits = model.forward(xb, training=True)
             loss, grad = cross_entropy_loss_and_grad(logits.reshape(len(xb), -1), yb)
             losses.append(loss)
-            # grad shape (N,10); feed into model.backward
             model.backward(grad)
+            probs = softmax(logits.reshape(len(xb), -1))
+            acc = accuracy(probs, yb)
+            accs.append(acc)
+            num_batches += 1
+            
+            # 每10个batch显示一次
+            if (num_batches % 10) == 0 or (i + batch_size >= n_train):
+                avg_loss = np.mean(losses[-10:]) if len(losses) >= 10 else np.mean(losses)
+                avg_acc = np.mean(accs[-10:]) if len(accs) >= 10 else np.mean(accs)
+                print(f"  Batch {num_batches:4d}/{steps_per_epoch} | Loss: {loss:.4f} | Acc: {acc:.4f} | Avg: Loss={avg_loss:.4f} Acc={avg_acc:.4f}", flush=True)
+                sys.stdout.flush()
+        
         avg_loss = np.mean(losses)
         history["loss"].append(avg_loss)
 
-        # eval on subset of test for speed
+        print("  Evaluating on test set...", end=' ', flush=True)
+        sys.stdout.flush()
         logits_test = model.forward(X_test[:2000], training=False)
         preds = np.argmax(softmax(logits_test.reshape(logits_test.shape[0], -1)), axis=1)
         val_acc = accuracy(preds, y_test[:2000])
         history["val_acc"].append(val_acc)
 
         if verbose:
-            print(f"Epoch {ep+1}/{epochs} - loss: {avg_loss:.4f} - val_acc: {val_acc:.4f} - time: {time.time()-t0:.1f}s")
+            print(f"Done | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | Time: {time.time()-t0:.1f}s", flush=True)
+            sys.stdout.flush()
 
     return history
 
@@ -476,11 +521,18 @@ def train(model, X_train, y_train, X_test, y_test,
 # 9. Run (main)
 # --------------------------
 def main():
+    print("Loading CIFAR-10 dataset...")
     X_train, y_train, X_test, y_test = load_cifar10()
-    # to speed up initial runs you can use subset:
-    # X_train, y_train = X_train[:10000], y_train[:10000]
+    print(f"Training data shape: {X_train.shape}, labels shape: {y_train.shape}")
+    print(f"Test data shape: {X_test.shape}, labels shape: {y_test.shape}")
+    
+    print("\nCreating model...")
     model = SimpleCNN(optimizer_name="adam", lr=1e-3)
-    hist = train(model, X_train, y_train, X_test, y_test, epochs=6, batch_size=128)
+    print("Training model...")
+    hist = train(model, X_train, y_train, X_test, y_test, epochs=50, batch_size=128, use_augmentation=True)
+
+    print("\nTraining completed!")
+    print(f"Final test accuracy: {hist['val_acc'][-1]:.4f}")
 
     # 绘图
     plt.figure(figsize=(10,4))
@@ -490,6 +542,8 @@ def main():
     plt.subplot(1,2,2)
     plt.plot(hist["val_acc"], label="val acc")
     plt.xlabel("epoch"); plt.ylabel("accuracy"); plt.legend()
+    plt.suptitle("Training curves")
+    plt.show()
     plt.suptitle("Training curves")
     plt.show()
 

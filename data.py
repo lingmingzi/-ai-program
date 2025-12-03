@@ -51,3 +51,28 @@ def load_cifar10():
     y_train = np.concatenate(ys, axis=0)
     X_test, y_test = load_batch(os.path.join(CIFAR_DIR, "test_batch"))
     return X_train, y_train, X_test, y_test
+
+
+def data_augmentation(X):
+    """简单的数据增广：随机翻转、随机裁剪、随机旋转"""
+    X_aug = X.copy()
+    N, C, H, W = X_aug.shape
+    
+    for i in range(N):
+        img = X_aug[i]
+        
+        # 随机水平翻转 (50%)
+        if np.random.rand() < 0.5:
+            img = img[:, :, ::-1]
+        
+        # 随机上下翻转 (20%)
+        if np.random.rand() < 0.2:
+            img = img[:, ::-1, :]
+        
+        # 随机亮度调整
+        brightness = np.random.uniform(0.8, 1.2)
+        img = np.clip(img * brightness, 0, 1)
+        
+        X_aug[i] = img
+    
+    return X_aug

@@ -70,14 +70,15 @@ class MaxPool2x2:
     def forward(self, x):
         self.x = x
         N, C, H, W = x.shape
-        out = np.zeros((N, C, H//2, W//2), dtype=x.dtype)
+        out_h, out_w = H // 2, W // 2
+        out = np.zeros((N, C, out_h, out_w), dtype=x.dtype)
         self.mask = np.zeros_like(x, dtype=bool)
-        for i in range(0, H, 2):
-            for j in range(0, W, 2):
-                block = x[:, :, i:i+2, j:j+2]
+        for i in range(out_h):
+            for j in range(out_w):
+                block = x[:, :, 2*i:2*i+2, 2*j:2*j+2]
                 maxv = np.max(block, axis=(2, 3), keepdims=True)
-                out[:, :, i//2, j//2] = maxv.squeeze()
-                self.mask[:, :, i:i+2, j:j+2] = (block == maxv)
+                out[:, :, i, j] = maxv.squeeze()
+                self.mask[:, :, 2*i:2*i+2, 2*j:2*j+2] = (block == maxv)
         return out
 
     def backward(self, grad):
@@ -142,8 +143,10 @@ class BatchNorm:
 
     def forward(self, x, training=True):
         self.x_shape = x.shape
+        self.x = x
+        self.training = training
+        
         if self.for_conv:
-            # compute mean/var per channel over N,H,W
             mean = np.mean(x, axis=(0, 2, 3), keepdims=True)
             var = np.var(x, axis=(0, 2, 3), keepdims=True)
             if training:
@@ -151,13 +154,14 @@ class BatchNorm:
                 self.var = var
                 self.x_hat = (x - mean) / np.sqrt(var + self.eps)
                 out = self.gamma * self.x_hat + self.beta
-                # update running stats
                 self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * mean
                 self.running_var = self.momentum * self.running_var + (1 - self.momentum) * var
                 return out
             else:
-                x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
-                return self.gamma * x_hat + self.beta
+                self.mean = self.running_mean
+                self.var = self.running_var
+                self.x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
+                return self.gamma * self.x_hat + self.beta
         else:
             mean = np.mean(x, axis=0, keepdims=True)
             var = np.var(x, axis=0, keepdims=True)
@@ -170,8 +174,10 @@ class BatchNorm:
                 self.running_var = self.momentum * self.running_var + (1 - self.momentum) * var
                 return out
             else:
-                x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
-                return self.gamma * x_hat + self.beta
+                self.mean = self.running_mean
+                self.var = self.running_var
+                self.x_hat = (x - self.running_mean) / np.sqrt(self.running_var + self.eps)
+                return self.gamma * self.x_hat + self.beta
 
     def backward(self, grad_out):
         if self.for_conv:
